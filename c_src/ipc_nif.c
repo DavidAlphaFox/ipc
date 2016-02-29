@@ -10,7 +10,6 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/event.h>
 #include <sys/time.h>
 #include <sys/select.h>
 #include <poll.h>
@@ -258,13 +257,13 @@ static ipc_shm_t* mem_open(char* name)
 static int mem_close(ipc_shm_t* mptr)
 {
     if (mptr != NULL) {
-	size_t len = mptr->size;
+	size_t len = mptr->size*sizeof(unsigned_t);
 	return munmap((void*) mptr, len);
     }
     return 0;
 }
 
-static int log2(unsigned_t x)
+static int ilog2(unsigned_t x)
 {
     int i = -1;
     while(x) {
@@ -424,7 +423,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
 	return enif_make_badarg(env);
     if (!enif_get_ulong(env, argv[2], &qsize))
 	return enif_make_badarg(env);
-    qexp = log2(qsize);
+    qexp = ilog2(qsize);
     if (qexp > 10)  // max size is 1024
 	return enif_make_badarg(env);
     qsize = (1 << qexp);
