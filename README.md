@@ -3,20 +3,29 @@ IPC
 
 The IPC api ( one instance only for now )
 
-	ipc:create(ShmName, MemorySize) -> ok | {error,Reason}
+    ipc:create(file_name(), MemorySize) -> ok | {error,Reason}
+    ipc:attach(file_name()) -> ok | {error,Reason}
+    ipc:create_queue(ipc_name(), type(), Size) -> {ok,id()} | {error,Reason}
+    ipc:create_condition(ipc_name(), condition()) -> {ok, id()} | {error,Reason}
+    ipc:lookup_queue(ipc_name()) -> {ok,id()} | {error,Reason}
+    ipc:lookup_condition(ipc_name()) -> {ok,id()} | {error,Reason}
+    ipc:info(ipc_ref(), ipc_item()) -> Value
+    ipc:info(ipc_ref()) -> [{ipc_item(),term()}]
+    ipc:publish(ipc_ref(), Value) -> ok | {error,Reason}
+    ipc:value(ipc_ref()) -> number()
+    ipc:subscribe(ipc_ref()) -> {ok,subscription()} | {error,Reason}
+    ipc:unsubscribe(subscription())
 
-	ipc:attach(ShmName) -> ok | {error,Reason}
+ipc_ref() :: ipc_name() | ip().
+filename() :: string().
+ipc_name() :: atom().
+id() :: unsigned().
+subscription() :: binary()
 
-    ipc:create_queue(Name, Type, Size) -> {ok,ID} | {error,Reason}
-
-	ipc:create_subscriber(Name, Expr) -> {ok, ID} | {error,Reason}
-
-	ipc:lookup_queue(Name) -> {ok,ID} | {error,Reason}
-
-	ipc:lookup_subscriber(Name) -> {ok,ID} | {error,Reason}
-
-	ipc:publish(Name|ID, Value) -> ok | {error,Reason}
-
-	ipc:subscribe(Name|ID) -> {ok,Ref} | {error,Reason}
-
-	ipc:unsubscribe(Ref)
+condition() :: true | false | ipc_name() | id() |
+	       {'not', condition()} |
+	       {'and', condition(), condition()} |
+	       {'or', condition(), condition()} |
+	       {'xor', condition(), condition()} |
+	       {'all', [condition()]} |
+	       {'any', [condition()]}.
