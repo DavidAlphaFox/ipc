@@ -119,7 +119,7 @@ subscribe_(_ID) ->
     erlang:error(nif_not_loaded).
 
 lookup_(eot, _ObjectType, _Name) ->
-    error;
+    {error,enoent};
 lookup_(Offset, ObjectType, Name) ->
     case info(Offset, object_type) of
 	ObjectType ->
