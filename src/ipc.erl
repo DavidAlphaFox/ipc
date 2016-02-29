@@ -18,14 +18,17 @@
 -export([publish/2]).
 -export([subscribe/1]).
 
--export([publish_/2]).
--export([subscribe_/1]).
 -export([compile/1, compile/2, compile_/2]).
 -export([optimise/1]).
 -export([eval/3]).
 -export([dump/0]).
 -export([test/0]).
 -export([test_compile/0]).
+
+%% low level nifs
+-export([publish_/2]).
+-export([subscribe_/1]).
+-export([create_cond_/3]).
 
 
 -type expr() :: {all,[expr()]} | {any,[expr()]} | {'not',expr()} | 
@@ -67,16 +70,23 @@ create_queue(_Name,_Type,_Size) ->
     erlang:error(nif_not_loaded).
 
 lookup_queue(Name) when is_atom(Name) ->
-    lookup_(first(), queue, atom_to_list(Name)).
+    lookup_(first(), queue, Name).
 
 -spec create_condition(Name::atom(), Expr::expr()) -> {ok,integer()} |
 						      {error,atom()}.
-create_condition(_Name, _Expr) ->
+create_condition(Name, Expr) ->
+    Prog = compile(Expr),
+    Queues = list_to_tuple(
+	       lists:usort([abs(Q) || 
+			       {Q,_} <- tuple_to_list(Prog), abs(Q) > 1])),
+    create_cond_(Name, Prog, Queues).
+    
+create_cond_(_Name, _Prog, _Queues) ->
     erlang:error(nif_not_loaded).
 
 -spec lookup_condition(Name::atom()) -> {ok,integer()} | {error,term()}.
 lookup_condition(Name) when is_atom(Name) ->
-    lookup_(first(), condition, atom_to_list(Name)).
+    lookup_(first(), condition, Name).
 
 -spec publish(Name::atom()|integer(), Value::number()) -> ok | {error,term()}.
 publish(Name, Value) when is_atom(Name) ->

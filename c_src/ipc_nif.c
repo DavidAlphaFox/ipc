@@ -42,20 +42,29 @@ typedef struct _ipc_queue_t {
 #define QUEUE_MAGIC 0xE1E2E3E4
 
 typedef struct _ipc_link_t {
-    long cnext;   // offset to next ipc_cond_t
-    long coffs;   // offset to current ipc_cond_t
-    long qoffs;   // offset to queue variable ipc_queue_t
-    long qtail;   // last position read in ipc_queue_t & qmask
+    integer_t cnext;   // offset to next ipc_cond_t
+    integer_t coffs;   // offset to current ipc_cond_t
+    integer_t qoffs;   // offset to queue variable ipc_queue_t
+    integer_t qtail;   // last position read in ipc_queue_t & qmask
 } ipc_link_t;
 
+// test if ipc_queue_t@qoffs is changed (negative is not)
+// the jump offs otherwise next operation
+// offs=0 == return FALSE, offs=1 == return TRUE
+typedef struct _ipc_instr_t {
+    integer_t qoffs;   // queue
+    unsigned_t joffs;  // jump offset
+} ipc_instr_t;
+
 typedef struct _ipc_cond_t {
-    unsigned_t size;      // total size of structure
-    unsigned_t magic;     // cond magic
-    unsigned_t nsize;     // name length
-    unsigned_t lsize;     // number of link fields
-    unsigned_t fsize;     // number of words of filter
-    pthread_cond_t cond;     // conditional variable
-    unsigned_t data[];    // name + filter + link data
+    unsigned_t size;       // total size of structure
+    unsigned_t magic;      // cond magic
+    unsigned_t nsize;      // name length
+    unsigned_t lsize;      // number of link fields
+    unsigned_t psize;      // number of words in prog
+    pthread_cond_t cond;   // conditional variable
+    pthread_mutex_t mutex; // condition mutex
+    unsigned_t data[];     // name + prog + link data
 } ipc_cond_t;
 
 #define COND_MAGIC 0xC1C2C3C4
@@ -131,8 +140,8 @@ static ERL_NIF_TERM nif_attach(ErlNifEnv* env, int argc,
 			       const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc, 
 				     const ERL_NIF_TERM argv[]);
-static ERL_NIF_TERM nif_create_condition(ErlNifEnv* env, int argc,
-					 const ERL_NIF_TERM argv[]);
+static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
+				    const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_first(ErlNifEnv* env, int argc,
 			      const ERL_NIF_TERM argv[]);
 static ERL_NIF_TERM nif_next(ErlNifEnv* env, int argc,
@@ -153,7 +162,7 @@ ErlNifFunc ipc_funcs[] =
     { "create",            2, nif_create },
     { "attach",            1, nif_attach },
     { "create_queue",      3, nif_create_queue },
-    { "create_condition",  2, nif_create_condition },
+    { "create_cond_",      3, nif_create_cond },
     { "first",             0, nif_first },
     { "next",              1, nif_next },
     { "info",              2, nif_info },
@@ -208,7 +217,7 @@ static ipc_shm_t* mem_create(char* name, size_t size, mode_t mode)
     pthread_mutexattr_setpshared(&attrmutex, PTHREAD_PROCESS_SHARED);
     if (pthread_mutex_init(&mptr->mtx, &attrmutex) < 0)
 	perror("pthread_mutex_init");
-    pthread_mutexattr_destroy(&attrmutex);
+    // pthread_mutexattr_destroy(&attrmutex);
     return mptr;
 }
 
@@ -310,6 +319,55 @@ static void ipc_queue_init(ipc_queue_t* ptr,
     memcpy(ptr->data, buf, n);
 }
 
+static void ipc_cond_init(ipc_cond_t* ptr,
+			  char* buf, int n, 
+			  ipc_instr_t* pp, int pn,
+			  unsigned_t* qp, int qn)
+{
+    pthread_condattr_t attrcond;
+    pthread_mutexattr_t attrmutex;
+    int i, j, offs;
+
+    ptr->magic = COND_MAGIC;
+    ptr->nsize = number_of_words(n);
+    ptr->lsize = qn;
+    ptr->psize = pn;
+    pthread_condattr_init(&attrcond);
+    pthread_condattr_setpshared(&attrcond, PTHREAD_PROCESS_SHARED);
+    pthread_cond_init(&ptr->cond, &attrcond);
+
+    pthread_mutexattr_init(&attrmutex);
+    pthread_mutexattr_setpshared(&attrmutex, PTHREAD_PROCESS_SHARED);
+    if (pthread_mutex_init(&ptr->mutex, &attrmutex) < 0)
+	perror("pthread_mutex_init");
+    // pthread_condattr_destroy(&attrcond);
+    memset(ptr->data, 0, 
+	   pn*sizeof(ipc_instr_t) + 
+	   qn*sizeof(ipc_link_t) + ptr->nsize*sizeof(unsigned_t));
+    memcpy(ptr->data, buf, n);  // copy name
+
+    // we may memcpy here
+    offs = ptr->nsize;
+    j = 0;
+    for (i = 0; i < pn; i++) {  // install prog
+	ipc_instr_t* ip = (ipc_instr_t*) &ptr->data[offs+j];
+	*ip = pp[i];
+	j += number_of_words(sizeof(ipc_instr_t));
+    }
+
+    // but not yet here
+    offs = ptr->nsize + pn*number_of_words(sizeof(ipc_instr_t));
+    j = 0;
+    for (i = 0; i < qn; i++) { // install links
+	ipc_link_t* lp = (ipc_link_t*) &ptr->data[offs+j];
+	lp->cnext = 0;  // fixme: link to queue link
+	lp->coffs = -(offs + number_of_words(sizeof(ipc_cond_t)));
+	lp->qoffs = qp[i];
+	lp->qtail = 0;  // last updated qhead value
+	j += number_of_words(sizeof(ipc_link_t));
+    }
+}
+
 static int get_type(ErlNifEnv* env, ERL_NIF_TERM arg, unsigned_t* type)
 {
     if (arg == ATOM(unsigned8))
@@ -406,7 +464,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
 				     const ERL_NIF_TERM argv[])
 {
     ipc_env_t* ctx = enif_priv_data(env);
-    char namebuf[256];
+    char buf[256];
     ipc_queue_t* qptr;
     unsigned_t type;
     unsigned_t size;
@@ -417,7 +475,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
 
     if (ctx->mapped == NULL)
 	return enif_make_badarg(env);
-    if (!(n=enif_get_atom(env,argv[0],namebuf,sizeof(namebuf),ERL_NIF_LATIN1)))
+    if (!(n=enif_get_atom(env,argv[0],buf,sizeof(buf),ERL_NIF_LATIN1)))
 	return enif_make_badarg(env);
     if (!get_type(env, argv[1], &type))
 	return enif_make_badarg(env);
@@ -431,26 +489,75 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
     
     if ((qptr = ipc_shm_alloc(ctx, size, &offset)) == NULL)
 	return enif_make_badarg(env);  // out of memory?
-    ipc_queue_init(qptr, namebuf, n, type, qexp);
+    ipc_queue_init(qptr, buf, n, type, qexp);
 
     return enif_make_tuple2(env, ATOM(ok), enif_make_ulong(env, offset));
 }
 
-static ERL_NIF_TERM nif_create_condition(ErlNifEnv* env, int argc,
-					 const ERL_NIF_TERM argv[])
+static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
+				    const ERL_NIF_TERM argv[])
 {
     ipc_env_t* ctx = enif_priv_data(env);
+    char buf[256];
+    ipc_cond_t* cptr;
+    unsigned_t size;
+    unsigned_t offset;
+    const ERL_NIF_TERM* prog;
+    const ERL_NIF_TERM* queues;
+    ipc_instr_t pw[256];
+    ipc_instr_t* pp = NULL;
+    unsigned_t qw[256];
+    unsigned_t* qp = NULL;
+    int i, j, n, pn, qn;
 
     if (ctx->mapped == NULL)
 	return enif_make_badarg(env);
-#if 0
-    pthread_condattr_t attrcond;
-    pthread_condattr_init(&attrcond);
-    pthread_condattr_setpshared(&attrcond, PTHREAD_PROCESS_SHARED);
-    pthread_cond_init(pcond, &attrcond);
+    if (!(n=enif_get_atom(env,argv[0],buf,sizeof(buf),ERL_NIF_LATIN1)))
+	return enif_make_badarg(env);
+    if (!enif_get_tuple(env,argv[1],&pn,&prog))
+	return enif_make_badarg(env);
+    if (!enif_get_tuple(env,argv[2],&qn,&queues))  // list of queues
+	return enif_make_badarg(env);
+    if (pn < 256) // program fit in fixed area
+	pp = pw;
+    else
+	pp = enif_alloc(sizeof(ipc_instr_t)*pn);
+    j = 0;
+    for (i = 0; i < pn; i++) {
+	int arity;
+	const ERL_NIF_TERM* instr;
 
-    // pthread_condattr_destroy(&attrcond);
-#endif
+	if (!enif_get_tuple(env,prog[i],&arity,&instr))
+	    goto error;
+	if (!enif_get_long(env,instr[0],&pp[i].qoffs))
+	    goto error;
+	// fixme: check that qoffs exist and is a queue
+	if (!enif_get_ulong(env,instr[0],&pp[i].joffs))
+	    goto error;
+    }
+    if (qn < 256)
+	qp = qw;
+    else
+	qp = enif_alloc(sizeof(unsigned_t)*qn);
+    j = 0;
+    for (i = 0; i < qn; i++) {
+	if (!enif_get_ulong(env,queues[i],&qp[j]))
+	    goto error;
+	// fixme: check that qp[j] exist and is a queue
+	j++;
+    }
+    size = number_of_words(sizeof(ipc_cond_t)) + number_of_words(n) +
+	number_of_words(sizeof(ipc_instr_t))*pn + 
+	number_of_words(sizeof(ipc_link_t))*qn;
+    if ((cptr = ipc_shm_alloc(ctx, size, &offset)) == NULL)
+	return enif_make_badarg(env);  // out of memory?
+    ipc_cond_init(cptr, buf, n, pp, pn, qp, qn);
+    if (pp != pw) enif_free(pp);
+    if (qp != qw) enif_free(qp);
+    return enif_make_tuple2(env, ATOM(ok), enif_make_ulong(env, offset));
+error:
+    if (pp && (pp != pw)) enif_free(pp);
+    if (qp && (qp != qw)) enif_free(qp);
     return enif_make_badarg(env);
 }
 
