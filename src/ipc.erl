@@ -75,10 +75,7 @@ lookup_queue(Name) when is_atom(Name) ->
 -spec create_condition(Name::atom(), Expr::expr()) -> {ok,integer()} |
 						      {error,atom()}.
 create_condition(Name, Expr) ->
-    Prog = compile(Expr),
-    Queues = list_to_tuple(
-	       lists:usort([abs(Q) || 
-			       {Q,_} <- tuple_to_list(Prog), abs(Q) > 1])),
+    {Queues,Prog} = compile(Expr),
     create_cond_(Name, Prog, Queues).
     
 create_cond_(_Name, _Prog, _Queues) ->
@@ -158,7 +155,11 @@ test() ->
     {ok,I2} = create_queue(queue2, unsigned32, 32),
     {ok,I3} = create_queue(my_queue, unsigned16, 8),
     {ok,I4} = create_queue(my_output, float32, 8),
-    [I1,I2,I3,I4].
+    %%
+    {ok,C1} = create_condition(cond1, {'or', queue1, queue2}),
+    {ok,C2} = create_condition(cond1, {'and', my_queue, my_output}),
+    %%
+    [I1,I2,I3,I4,C1,C2].
 
 test_compile() ->
     Env = #{ a => 10, b => 12, c=>13 },
@@ -190,10 +191,21 @@ test_comp(E, Env) ->
 -define(FALSE, -1).
 -define(RETURN_TRUE,  {?TRUE,1}).
 -define(RETURN_FALSE, {?TRUE,0}).
--define(NOOP,         {0,0}). %% special case!
+-define(NOP,          {0,0}). %% special case!
 
 compile(E) ->
-    optimise(compile(E, #{})).
+    Prog1 = compile(E, #{}),
+    Prog2 = optimise(Prog1),
+    R = {Q,Prog3} = normalize(Prog2),
+    io:format("Q = ~p, Prog=~p\n", [Q,Prog3]),
+    R.
+
+normalize(Prog) ->
+    Ls = tuple_to_list(Prog),
+    Qs = [0,1|lists:usort([abs(Q) || {Q,_} <- Ls, abs(Q) > 1])],
+    Map = maps:from_list(lists:zip(Qs, lists:seq(0,length(Qs)-1))),
+    NProg = list_to_tuple([{maps:get(Q,Map),Offs} || {Q,Offs} <- Ls]),
+    {list_to_tuple(Qs),NProg}.
 
 compile(E,Env) ->
     Es = compile_(E,Env),
@@ -248,10 +260,26 @@ optimise(Prog) ->
     io:format(" short: ~p\n", [Prog1]),
     %% Prog2 = move_jumps(1, Prog1),
     %% io:format(" move: ~p\n", [Prog2]),
-    Prog3 = remove_unreach(Prog1),
-    io:format(" unreach: ~p\n", [Prog3]),
-    Prog3.
+    Prog2 = remove_unreach(Prog1),
+    io:format(" unreach(1): ~p\n", [Prog2]),
+    Prog3 = remove_nops(Prog2),
+    io:format(" nops: ~p\n", [Prog3]),
+    Prog4 = remove_unreach(Prog3),
+    io:format(" unreach(2): ~p\n", [Prog4]),
+    Prog4.
 
+%% remove nop {0,0} from the code
+remove_nops(Prog) ->
+    remove_instructions(nop_list(Prog,1,[]),Prog).
+
+nop_list(Prog,I,Acc) when I > tuple_size(Prog) ->
+    Acc;
+nop_list(Prog,I,Acc) ->
+    case element(I,Prog) of
+	?NOP -> nop_list(Prog,I+1,[I|Acc]);
+	_ -> nop_list(Prog,I+1,Acc)
+    end.
+    
 %% add negations 
 %%     {Q,Offs}, {1,0} ... {A,B} => 
 %%        {-Q,0}, {1,Offs-1} ... {A,B}
@@ -280,7 +308,7 @@ update_offset(0, Prog, _Jump) ->
 update_offset(I, Prog, Jump) ->
     case element(I, Prog) of
 	{_Q, 2} when 2 > Jump -> %% test is noop
-	    update_offset(I-1, setelement(I, Prog, ?NOOP), Jump+1);
+	    update_offset(I-1, setelement(I, Prog, ?NOP), Jump+1);
 	{Q, J} when J > Jump ->
 	    update_offset(I-1, setelement(I, Prog, {Q,J-1}), Jump+1);
 	_ ->
@@ -370,7 +398,7 @@ eval(Prog, Clock, Env) ->
 
 eval(I, Prog, Clock, Env) ->
     case element(I, Prog) of
-	?NOOP -> eval(I+1,Prog,Clock,Env);
+	?NOP -> eval(I+1,Prog,Clock,Env);
 	?RETURN_TRUE -> true;
 	?RETURN_FALSE -> false;
 	{Q,Offs} ->

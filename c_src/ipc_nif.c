@@ -42,10 +42,10 @@ typedef struct _ipc_queue_t {
 #define QUEUE_MAGIC 0xE1E2E3E4
 
 typedef struct _ipc_link_t {
-    integer_t cnext;   // offset to next ipc_cond_t
-    integer_t coffs;   // offset to current ipc_cond_t
-    integer_t qoffs;   // offset to queue variable ipc_queue_t
-    integer_t qtail;   // last position read in ipc_queue_t & qmask
+    integer_t cnext;   // rel offset to next ipc_cond_t
+    integer_t coffs;   // rel offset to current ipc_cond_t
+    unsigned_t qid;    // abs offset to queue variable ipc_queue_t
+    unsigned_t qtail;  // last position read in ipc_queue_t & qmask
 } ipc_link_t;
 
 // test if ipc_queue_t@qoffs is changed (negative is not)
@@ -83,6 +83,7 @@ typedef struct _ipc_env_t {
 
 // fixme read cacheline value
 #define MEM_ALIGN_SIZE  (64/sizeof(unsigned_t))  
+#define FIRST MEM_ALIGN_SIZE
 
 #define align(x, n)  (((((x)+(n)-1)/(n)))*(n))
 
@@ -283,10 +284,10 @@ static int ilog2(unsigned_t x)
 }
 
 // alloc nwords of data
-static void* ipc_shm_alloc(ipc_env_t* ctx, unsigned_t nwords,
+static void* ipc_shm_alloc(ipc_env_t* eptr, unsigned_t nwords,
 			   unsigned_t* offset)
 {
-    ipc_shm_t* mp = ctx->mapped;
+    ipc_shm_t* mp = eptr->mapped;
     unsigned_t* ptr = NULL;
     unsigned_t size;
 
@@ -317,6 +318,66 @@ static void ipc_queue_init(ipc_queue_t* ptr,
     ptr->qhead = 0;
     memset(ptr->data, 0, (ptr->nsize+ptr->qsize)*sizeof(unsigned_t));
     memcpy(ptr->data, buf, n);
+}
+
+static ipc_instr_t* ipc_cond_prog(ipc_cond_t* ptr)
+{
+    return (ipc_instr_t*) &ptr->data[ptr->nsize];
+}
+
+static ipc_link_t* ipc_cond_links(ipc_cond_t* ptr)
+{
+    return (ipc_link_t*) (ipc_cond_prog(ptr) + ptr->psize);
+}
+
+static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
+{
+    ipc_shm_t* mptr = eptr->mapped;
+    ipc_instr_t* prog;
+    ipc_link_t* links = ipc_cond_links(ptr);
+    int j = 0;
+
+    prog = (ipc_instr_t*) &ptr->data[ptr->nsize];
+    while(j < ptr->psize) {
+	integer_t q = prog[j].qoffs;  // offset in links!
+	unsigned_t qid;
+	int negated = (q < 0);
+	int updated = 0;
+	ipc_link_t* lptr;
+	ipc_queue_t* qptr;
+
+	if (negated) q = -q;
+	if (q >= ptr->lsize)
+	    return -1;
+	lptr = &links[q];
+	qid  = lptr->qid;
+	if (qid >= (mptr->size-number_of_words(sizeof(ipc_shm_t))))
+	    return -1;
+	switch(qid) {
+	case 0: updated = 0; break;
+	case 1: updated = negated ? 0 : 1; break;
+	default:
+	    if (mptr->data[lptr->qid+1] != QUEUE_MAGIC)
+		return -1;
+	    qptr = (ipc_queue_t*) &mptr->data[lptr->qid];
+	    if (!negated && (qptr->qhead != lptr->qtail))
+		updated = 1;
+	    else if (negated && !(qptr->qhead != lptr->qtail))
+		updated = 1;
+	    break;
+	}
+	if (updated) {
+	    switch(prog[j].joffs) {
+	    case 0: return 0;
+	    case 1: return 1;
+	    default: j = j + prog[j].joffs; break;
+	    }
+	}
+	else
+	    j = j+1;
+    }
+    // program should return before this point
+    return -1;
 }
 
 static void ipc_cond_init(ipc_cond_t* ptr,
@@ -355,14 +416,15 @@ static void ipc_cond_init(ipc_cond_t* ptr,
 	j += number_of_words(sizeof(ipc_instr_t));
     }
 
-    // but not yet here
+    // but not here, index=0 and index=1 are not used, used for
+    // nop and branch always / never
     offs = ptr->nsize + pn*number_of_words(sizeof(ipc_instr_t));
     j = 0;
     for (i = 0; i < qn; i++) { // install links
 	ipc_link_t* lp = (ipc_link_t*) &ptr->data[offs+j];
 	lp->cnext = 0;  // fixme: link to queue link
 	lp->coffs = -(offs + number_of_words(sizeof(ipc_cond_t)));
-	lp->qoffs = qp[i];
+	lp->qid   = qp[i];
 	lp->qtail = 0;  // last updated qhead value
 	j += number_of_words(sizeof(ipc_link_t));
     }
@@ -415,9 +477,10 @@ static ERL_NIF_TERM make_type(ErlNifEnv* env, unsigned_t type)
 static ERL_NIF_TERM nif_create(ErlNifEnv* env, int argc, 
 			       const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     char buf[1024];
     unsigned_t size;
+    unsigned_t offset;
     ipc_shm_t* mptr;
     int mode = S_IRWXU | S_IRWXG;
     int n;
@@ -427,13 +490,14 @@ static ERL_NIF_TERM nif_create(ErlNifEnv* env, int argc,
     if (!enif_get_ulong(env, argv[1], &size))
 	return enif_make_badarg(env);
 
-    if (ctx->mapped != NULL)
+    if (eptr->mapped != NULL)
 	return enif_make_badarg(env);
 
-    if ((mptr = mem_create(buf, size, mode)) == NULL)
+    if ((mptr = mem_create(buf, size+MEM_ALIGN_SIZE, mode)) == NULL)
 	return enif_make_badarg(env);
-
-    ctx->mapped = mptr;
+    eptr->mapped = mptr;
+    // now allocate one zero cache line, qid=0 can not be used as a queue
+    ipc_shm_alloc(eptr, MEM_ALIGN_SIZE, &offset);
     
     return ATOM(ok);
 }
@@ -441,7 +505,7 @@ static ERL_NIF_TERM nif_create(ErlNifEnv* env, int argc,
 static ERL_NIF_TERM nif_attach(ErlNifEnv* env, int argc, 
 			       const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     char namebuf[1024];
     ipc_shm_t* mptr;
     int n;
@@ -449,11 +513,11 @@ static ERL_NIF_TERM nif_attach(ErlNifEnv* env, int argc,
     if (!(n=enif_get_string(env,argv[0],namebuf,sizeof(namebuf),
 			    ERL_NIF_LATIN1)))
 	return enif_make_badarg(env);
-    if (ctx->mapped != NULL)
+    if (eptr->mapped != NULL)
 	return enif_make_badarg(env);
     if ((mptr = mem_open(namebuf)) == NULL)
 	return enif_make_badarg(env);
-    ctx->mapped = mptr;
+    eptr->mapped = mptr;
     return ATOM(ok);
 }
 
@@ -463,7 +527,7 @@ static ERL_NIF_TERM nif_attach(ErlNifEnv* env, int argc,
 static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
 				     const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     char buf[256];
     ipc_queue_t* qptr;
     unsigned_t type;
@@ -473,7 +537,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
     int qexp;
     int n;
 
-    if (ctx->mapped == NULL)
+    if (eptr->mapped == NULL)
 	return enif_make_badarg(env);
     if (!(n=enif_get_atom(env,argv[0],buf,sizeof(buf),ERL_NIF_LATIN1)))
 	return enif_make_badarg(env);
@@ -487,7 +551,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
     qsize = (1 << qexp);
     size = number_of_words(sizeof(ipc_queue_t)) + number_of_words(n) + qsize;
     
-    if ((qptr = ipc_shm_alloc(ctx, size, &offset)) == NULL)
+    if ((qptr = ipc_shm_alloc(eptr, size, &offset)) == NULL)
 	return enif_make_badarg(env);  // out of memory?
     ipc_queue_init(qptr, buf, n, type, qexp);
 
@@ -497,7 +561,7 @@ static ERL_NIF_TERM nif_create_queue(ErlNifEnv* env, int argc,
 static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
 				    const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     char buf[256];
     ipc_cond_t* cptr;
     unsigned_t size;
@@ -510,7 +574,7 @@ static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
     unsigned_t* qp = NULL;
     int i, j, n, pn, qn;
 
-    if (ctx->mapped == NULL)
+    if (eptr->mapped == NULL)
 	return enif_make_badarg(env);
     if (!(n=enif_get_atom(env,argv[0],buf,sizeof(buf),ERL_NIF_LATIN1)))
 	return enif_make_badarg(env);
@@ -549,7 +613,7 @@ static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
     size = number_of_words(sizeof(ipc_cond_t)) + number_of_words(n) +
 	number_of_words(sizeof(ipc_instr_t))*pn + 
 	number_of_words(sizeof(ipc_link_t))*qn;
-    if ((cptr = ipc_shm_alloc(ctx, size, &offset)) == NULL)
+    if ((cptr = ipc_shm_alloc(eptr, size, &offset)) == NULL)
 	return enif_make_badarg(env);  // out of memory?
     ipc_cond_init(cptr, buf, n, pp, pn, qp, qn);
     if (pp != pw) enif_free(pp);
@@ -568,7 +632,7 @@ static ERL_NIF_TERM nif_first(ErlNifEnv* env, int argc,
 
     if (eptr->mapped == NULL)
 	return enif_make_badarg(env);
-    return enif_make_ulong(env, 0);
+    return enif_make_ulong(env, FIRST);
 }
 
 static ERL_NIF_TERM nif_next(ErlNifEnv* env, int argc, 
@@ -639,13 +703,13 @@ static ERL_NIF_TERM nif_info(ErlNifEnv* env, int argc,
 static ERL_NIF_TERM nif_publish(ErlNifEnv* env, int argc, 
 				const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     ipc_shm_t* mptr;
     ipc_queue_t* qptr;
     unsigned_t offset;
     long value;
 
-    if ((mptr = ctx->mapped) == NULL)
+    if ((mptr = eptr->mapped) == NULL)
 	return enif_make_badarg(env);
     if (!enif_get_ulong(env, argv[0], &offset))
 	return enif_make_badarg(env);
@@ -655,23 +719,37 @@ static ERL_NIF_TERM nif_publish(ErlNifEnv* env, int argc,
 	return enif_make_badarg(env);
     if (mptr->data[offset+1] != QUEUE_MAGIC)    // assume magic field
 	return enif_make_badarg(env);
+    // fixme: add rw_lock to queue
     qptr = (ipc_queue_t*) &mptr->data[offset];
     qptr->data[qptr->nsize + qptr->qhead] = value;
     qptr->qhead = (qptr->qhead+1) & qptr->qmask;
+
+    // scan link fields and eval conditions
+    offset = qptr->lfirst;
+    while(offset) {
+	ipc_link_t* lptr = (ipc_link_t*) &mptr->data[offset];
+	ipc_cond_t* cptr = (ipc_cond_t*) &mptr->data[offset+lptr->coffs];
+	if (ipc_cond_eval(eptr, cptr) == 1) {
+	    pthread_mutex_lock(&cptr->mutex);
+	    pthread_cond_broadcast(&cptr->cond);
+	    pthread_mutex_unlock(&cptr->mutex);
+	}
+	offset = lptr->cnext;
+    }
     return ATOM(ok);
 }
 
 static ERL_NIF_TERM nif_value(ErlNifEnv* env, int argc, 
 			      const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     ipc_shm_t* mptr;
     ipc_queue_t* qptr;
     unsigned_t offset;
     unsigned_t qpos;
     unsigned_t index;
 
-    if ((mptr = ctx->mapped) == NULL)
+    if ((mptr = eptr->mapped) == NULL)
 	return enif_make_badarg(env);
     if (!enif_get_ulong(env, argv[0], &offset))
 	return enif_make_badarg(env);
@@ -690,22 +768,22 @@ static ERL_NIF_TERM nif_value(ErlNifEnv* env, int argc,
 static ERL_NIF_TERM nif_subscribe(ErlNifEnv* env, int argc, 
 				  const ERL_NIF_TERM argv[])
 {
-    ipc_env_t* ctx = enif_priv_data(env);
+    ipc_env_t* eptr = enif_priv_data(env);
     ipc_shm_t* mptr;
 
-    if ((mptr = ctx->mapped) == NULL)
+    if ((mptr = eptr->mapped) == NULL)
 	return enif_make_badarg(env);
     return enif_make_badarg(env);
 }
 
 static int  ipc_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
 {
-    ipc_env_t* ctx;
+    ipc_env_t* eptr;
 
-    if ((ctx = enif_alloc(sizeof(ipc_env_t))) == NULL)
+    if ((eptr = enif_alloc(sizeof(ipc_env_t))) == NULL)
 	return -1;
-    memset(ctx, 0, sizeof(ipc_env_t));
-    *priv_data = ctx;
+    memset(eptr, 0, sizeof(ipc_env_t));
+    *priv_data = eptr;
     LOAD_ATOM(ok);
     LOAD_ATOM(error);
     LOAD_ATOM(eot);
@@ -738,11 +816,11 @@ static int ipc_upgrade(ErlNifEnv* env, void** priv_data, void** old_priv_data,
 
 static void ipc_unload(ErlNifEnv* env, void* priv_data)
 {
-    ipc_env_t* ctx = priv_data;
+    ipc_env_t* eptr = priv_data;
     
-    mem_close(ctx->mapped);
+    mem_close(eptr->mapped);
 
-    enif_free(ctx);
+    enif_free(eptr);
 }
 
 ERL_NIF_INIT(ipc, ipc_funcs, 
