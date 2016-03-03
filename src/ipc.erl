@@ -57,10 +57,18 @@ info(Offset) ->
     Name = info(Offset, name),
     ObjectType = info(Offset, object_type),
     if ObjectType =:= queue ->
-	    [{object_type, ObjectType}, {name,Name}, {id, Offset},
-	     {size, info(Offset, size)}, {type,info(Offset, type)}];
+	    [{object_type, ObjectType},
+	     {name,Name},
+	     {id, Offset},
+	     {size, info(Offset,size)}, 
+	     {type,info(Offset,type)},
+	     {link, info(Offset,link)}
+	    ];
        ObjectType =:= condition ->
-	    [{object_type, ObjectType}, {name,Name}, {id, Offset}]
+	    [{object_type, ObjectType},
+	     {name,Name}, {id, Offset},
+	     {links, info(Offset,links)}
+	    ]
     end.
 
 info(_Offset, _What) ->
@@ -157,7 +165,7 @@ test() ->
     {ok,I4} = create_queue(my_output, float32, 8),
     %%
     {ok,C1} = create_condition(cond1, {'or', queue1, queue2}),
-    {ok,C2} = create_condition(cond1, {'and', my_queue, my_output}),
+    {ok,C2} = create_condition(cond2, {'and', my_queue, my_output}),
     %%
     [I1,I2,I3,I4,C1,C2].
 
