@@ -117,7 +117,7 @@ DECL_ATOM(type);
 DECL_ATOM(name);
 DECL_ATOM(link);
 DECL_ATOM(links);
-
+DECL_ATOM(subscription);
 #define TYPE_UNSIGNED8   1
 #define TYPE_UNSIGNED16  2
 #define TYPE_UNSIGNED32  3
@@ -169,7 +169,7 @@ ErlNifFunc ipc_funcs[] =
     { "next",              1, nif_next },
     { "info",              2, nif_info },
     { "publish_",          2, nif_publish },
-    { "subscribe_",        1, nif_subscribe },
+    { "subscribe_",        2, nif_subscribe },
     { "value_",            2, nif_value },
 };
 
@@ -369,16 +369,16 @@ static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
     ipc_link_t* links = ipc_cond_links(ptr);
     int j = 0;
 
-    fprintf(stderr, "cond_eval: %s\r\n", (char*) ptr->data);
+    // fprintf(stderr, "cond_eval: %s\r\n", (char*) ptr->data);
 
     prog = (ipc_instr_t*) &ptr->data[ptr->nsize];
     while(j < ptr->psize) {
 	integer_t q = prog[j].qoffs;  // offset in links!
 	unsigned_t qid;
 	int negated = (q < 0);
-	int updated = 0;
 	ipc_link_t* lptr;
 	ipc_queue_t* qptr;
+	int condition = 0;
 
 	if (negated) q = -q;
 	if (q >= ptr->lsize)
@@ -388,21 +388,21 @@ static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
 	if (qid >= (mptr->size-number_of_words(sizeof(ipc_shm_t))))
 	    return -1;
 	switch(qid) {
-	case 0: updated = 0; break;
-	case 1: updated = negated ? 0 : 1; break;
+	case 0: break;
+	case 1: condition = !negated; break;
 	default:
 	    if (mptr->data[lptr->qid+1] != QUEUE_MAGIC)
 		return -1;
 	    qptr = (ipc_queue_t*) &mptr->data[lptr->qid];
 	    if (!negated && (qptr->qhead != lptr->qtail))
-		updated = 1;
+		condition = 1;
 	    else if (negated && !(qptr->qhead != lptr->qtail))
-		updated = 1;
-	    fprintf(stderr, "  check %s%s = %d\r\n", negated?"~":"",
-		    (char*) qptr->data, updated);
+		condition = 1;
+	    // fprintf(stderr, "  check %s%s = %d\r\n", negated?"~":"",
+	    //	    (char*) qptr->data, condition);
 	    break;
 	}
-	if (updated) {
+	if (condition) {
 	    switch(prog[j].joffs) {
 	    case 0: return 0;
 	    case 1: return 1;
@@ -412,8 +412,27 @@ static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
 	else
 	    j = j+1;
     }
-    // program should return before this point
-    return -1;
+    return -1; // program should return before this point
+}
+
+// commit changes for the condition
+static int ipc_cond_commit(ipc_env_t* eptr, ipc_cond_t* ptr)
+{
+    ipc_shm_t* mptr = eptr->mapped;
+    ipc_link_t* links = ipc_cond_links(ptr);
+    int j;
+
+    // fprintf(stderr, "cond_commit: %s\r\n", (char*) ptr->data);
+
+    for (j = 0; j < ptr->lsize; j++) {
+	ipc_link_t* lptr = &links[j];
+	unsigned_t qid = lptr->qid;
+	if (qid > 1) {
+	    ipc_queue_t* qptr = (ipc_queue_t*) &mptr->data[qid];
+	    lptr->qtail = qptr->qhead;
+	}
+    }
+    return 0;
 }
 
 static void ipc_cond_init(ipc_env_t* eptr,
@@ -786,12 +805,9 @@ static ERL_NIF_TERM nif_publish(ErlNifEnv* env, int argc,
 	return enif_make_badarg(env);
     if (!enif_get_long(env, argv[1], &value))
 	return enif_make_badarg(env);
-    if (offset >= (mptr->size-number_of_words(sizeof(ipc_shm_t))))
+    if ((qptr = ipc_queue_lookup(eptr, offset)) == NULL)
 	return enif_make_badarg(env);
-    if (mptr->data[offset+1] != QUEUE_MAGIC)    // assume magic field
-	return enif_make_badarg(env);
-    // fixme: add rw_lock to queue
-    qptr = (ipc_queue_t*) &mptr->data[offset];
+    // fixme: add rw_lock + lock head mutex
     qptr->data[qptr->nsize + qptr->qhead] = value;
     qptr->qhead = (qptr->qhead+1) & qptr->qmask;
 
@@ -802,6 +818,7 @@ static ERL_NIF_TERM nif_publish(ErlNifEnv* env, int argc,
 	ipc_cond_t* cptr = (ipc_cond_t*) &mptr->data[offset+lptr->coffs];
 	if (ipc_cond_eval(eptr, cptr) == 1) {
 	    pthread_mutex_lock(&cptr->mutex);
+	    ipc_cond_commit(eptr, cptr);
 	    pthread_cond_broadcast(&cptr->cond);
 	    pthread_mutex_unlock(&cptr->mutex);
 	}
@@ -829,15 +846,102 @@ static ERL_NIF_TERM nif_value(ErlNifEnv* env, int argc,
     return enif_make_ulong(env, qptr->data[qptr->nsize + qpos]);
 }
 
+typedef struct {
+    ErlNifEnv*    env;
+    ipc_shm_t*    mptr;
+    ipc_cond_t*   cond;
+    unsigned_t    cid;
+    ErlNifTid     tid;
+    ErlNifPid     pid;
+    ERL_NIF_TERM  message;
+} subscription_t;
+
+static void* do_wait_cond(void* arg)
+{
+    subscription_t* sub = (subscription_t*) arg;
+    ErlNifEnv*      env;
+    ERL_NIF_TERM    m;
+    size_t          nvalues = sub->cond->lsize;
+    unsigned_t      value[64];
+    unsigned_t      tail[64];
+    ERL_NIF_TERM    term[64];
+    unsigned_t*     valp;
+    unsigned_t*     tailp;
+    ERL_NIF_TERM*   termp;
+    
+    env = enif_alloc_env();
+
+    if (nvalues <= 64) {
+	valp = value;
+	tailp = tail;
+	termp = term;
+    }
+    else {
+	valp = enif_alloc(sizeof(unsigned_t)*nvalues);
+	tailp = enif_alloc(sizeof(unsigned_t)*nvalues);
+	termp = enif_alloc(sizeof(ERL_NIF_TERM)*nvalues);
+    }
+    
+    while(1) {
+	int i;
+	ipc_link_t* link = ipc_cond_links(sub->cond);
+	pthread_mutex_lock(&sub->cond->mutex);
+	pthread_cond_wait(&sub->cond->cond, &sub->cond->mutex);
+
+	// copy values
+	for (i = 2; i < nvalues; i++) {
+	    unsigned_t qid = link[i].qid;
+	    ipc_queue_t* qptr = (ipc_queue_t*) &sub->mptr->data[qid];
+	    valp[i-2] = qptr->data[qptr->nsize + tailp[i]];
+	    tailp[i] = (tailp[i]+1) & qptr->qmask;
+	}
+	pthread_mutex_unlock(&sub->cond->mutex);
+
+	for (i = 2; i < nvalues; i++) {
+	    // fixme: convert according to type
+	    termp[i-2] = enif_make_ulong(env, valp[i-2]);
+	}
+	// make a local message copy
+	m = enif_make_copy(env, sub->message);
+	m = enif_make_tuple4(env,
+			     ATOM(subscription),
+			     enif_make_ulong(env, sub->cid),
+			     enif_make_tuple_from_array(env, termp, nvalues-2),
+			     m);
+	enif_send(0, &sub->pid, env, m);
+	enif_clear_env(env);
+    }
+}
+
 static ERL_NIF_TERM nif_subscribe(ErlNifEnv* env, int argc, 
 				  const ERL_NIF_TERM argv[])
 {
     ipc_env_t* eptr = enif_priv_data(env);
-    ipc_shm_t* mptr;
+    subscription_t* sub = NULL;
+    unsigned_t cid;
 
-    if ((mptr = eptr->mapped) == NULL)
+    if (!enif_get_ulong(env, argv[0], &cid))
 	return enif_make_badarg(env);
-    return enif_make_badarg(env);
+    if (!(sub = enif_alloc(sizeof(subscription_t))))
+	return enif_make_badarg(env);
+    memset(sub, 0, sizeof(subscription_t));
+    if ((sub->cond = ipc_cond_lookup(eptr, cid)) == NULL)
+	goto error;
+    sub->cid = cid;
+    if (!(sub->env = enif_alloc_env()))
+	goto error;
+    if (!enif_self(env, &sub->pid))
+	goto error;
+    sub->mptr = eptr->mapped;
+    sub->message = enif_make_copy(sub->env, argv[1]);
+    enif_thread_create("ipc_subscription", &sub->tid, do_wait_cond, sub, NULL);
+    return ATOM(ok);
+error:
+    if (sub->env)
+	enif_free_env(sub->env);
+    if (sub)
+	enif_free(sub);
+    return enif_make_badarg(env);    
 }
 
 static int  ipc_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
@@ -869,6 +973,7 @@ static int  ipc_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
     LOAD_ATOM(name);
     LOAD_ATOM(link);
     LOAD_ATOM(links);
+    LOAD_ATOM(subscription);
     return 0;
 }
 

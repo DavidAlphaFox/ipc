@@ -16,18 +16,18 @@
 -export([first/0, next/1, info/1, info/2]).
 -export([value/1, value/2]).
 -export([publish/2]).
--export([subscribe/1]).
+-export([subscribe/2]).
 
 -export([compile/1, compile/2, compile_/2]).
 -export([optimise/1]).
 -export([eval/3]).
 -export([dump/0]).
--export([test/0]).
+-export([test/0, bench/0, bench_read/1]).
 -export([test_compile/0]).
 
 %% low level nifs
 -export([publish_/2]).
--export([subscribe_/1]).
+-export([subscribe_/2]).
 -export([create_cond_/3]).
 
 
@@ -121,16 +121,17 @@ value(ID,Index) when is_integer(ID),is_integer(Index), Index >= 0 ->
 value_(_ID,_Index) ->
     erlang:error(nif_not_loaded).
 
--spec subscribe(Name::atom()|integer()) -> {ok,binary()} | {error,term()}.
-subscribe(Name) when is_atom(Name) ->
+-spec subscribe(Name::atom()|integer(),Message::term()) ->
+		       {ok,binary()} | {error,term()}.
+subscribe(Name,Message) when is_atom(Name) ->
     case lookup_condition(Name) of
-	{ok, ID} -> subscribe_(ID);
+	{ok, ID} -> subscribe_(ID,Message);
 	Error -> Error
     end;
-subscribe(ID) when is_integer(ID) ->
-     subscribe_(ID).
+subscribe(ID,Message) when is_integer(ID) ->
+     subscribe_(ID,Message).
 
-subscribe_(_ID) ->
+subscribe_(_ID,_Message) ->
     erlang:error(nif_not_loaded).
 
 lookup_(eot, _ObjectType, _Name) ->
@@ -159,15 +160,55 @@ dump(Offset) ->
 
 test() ->
     create("foo", 64*1024),
-    {ok,I1} = create_queue(queue1, unsigned32, 128),
-    {ok,I2} = create_queue(queue2, unsigned32, 32),
+    {ok,I1} = create_queue(queue1, unsigned32, 1024),
+    {ok,I2} = create_queue(queue2, unsigned32, 1024),
     {ok,I3} = create_queue(my_queue, unsigned16, 8),
     {ok,I4} = create_queue(my_output, float32, 8),
     %%
     {ok,C1} = create_condition(cond1, {'or', queue1, queue2}),
     {ok,C2} = create_condition(cond2, {'and', my_queue, my_output}),
+    {ok,C3} = create_condition(cond3, 
+			       {'xor', {'and', my_queue, my_output},
+				{'and', queue1, queue2}}),
     %%
-    [I1,I2,I3,I4,C1,C2].
+    [I1,I2,I3,I4,C1,C2,C3].
+
+bench() ->
+    N = 2000000,
+    T0 = erlang:system_time(micro_seconds),
+    bench_loop(N),
+    T1 = erlang:system_time(micro_seconds),
+    trunc((N/(T1-T0))*1000000).
+
+bench_loop(0) ->
+    ok;
+bench_loop(I) ->
+    ipc:publish(queue1, I),
+    bench_loop(I-1).
+
+bench_read(Cond) when is_atom(Cond) ->
+    case lookup_condition(Cond) of
+	{ok,CID} ->
+	    ipc:subscribe(CID, ready),
+	    timer:send_after(10000, stop),
+	    read_loop(CID, ready, 1000000, 0);
+	Error -> Error
+    end.
+
+read_loop(_CID, _Tag, I, N) when I < 0 ->
+    N;
+read_loop(CID, Tag, I, N) ->
+    receive
+	{subscription, CID, Vs, Tag} ->
+	    J = element(1, Vs),
+	    if I =/= J ->
+		    read_loop(CID, Tag, J-1, N+1);
+	       true ->
+		    read_loop(CID, Tag, I-1, N)
+	    end;
+	stop ->
+	    N
+    end.
 
 test_compile() ->
     Env = #{ a => 10, b => 12, c=>13 },
