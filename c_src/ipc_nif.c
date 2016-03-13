@@ -44,7 +44,6 @@ typedef struct _ipc_link_t {
     integer_t cnext;   // rel offset to next ipc_cond_t
     integer_t coffs;   // rel offset to current ipc_cond_t
     unsigned_t qid;    // abs offset to queue variable ipc_queue_t
-    unsigned_t qtail;  // last position read in ipc_queue_t & qmask
 } ipc_link_t;
 
 // test if ipc_queue_t@qoffs is changed (negative is not)
@@ -63,7 +62,7 @@ typedef struct _ipc_cond_t {
     unsigned_t psize;      // number of instructions in prog
     pthread_cond_t cond;   // conditional variable
     pthread_mutex_t mutex; // condition mutex
-    unsigned_t data[];     // name + prog + link data
+    unsigned_t data[];     // name + prog + link data + tail data
 } ipc_cond_t;
 
 #define COND_MAGIC 0xC1C2C3C4
@@ -87,6 +86,16 @@ typedef struct _ipc_env_t {
 #define align(x, n)  (((((x)+(n)-1)/(n)))*(n))
 
 #define number_of_words(n) (((n)+sizeof(unsigned_t)-1)/sizeof(unsigned_t))
+
+#define assert_magic(mptr, offset, magic) do { \
+	if ((mptr)->data[(offset)+1] != (magic)) return -1;	\
+    } while(0)
+
+#define assert_queue(mptr, offset) \
+    assert_magic((mptr),(offset), QUEUE_MAGIC)
+
+#define assert_cond(mptr, offset) \
+    assert_magic((mptr),(offset), QUEUE_COND)
 
 #define ATOM(name) atm_##name
 
@@ -362,9 +371,13 @@ static ipc_link_t* ipc_cond_links(ipc_cond_t* ptr)
     return (ipc_link_t*) (ipc_cond_prog(ptr) + ptr->psize);
 }
 
-static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
+static unsigned_t* ipc_cond_tail(ipc_cond_t* ptr)
 {
-    ipc_shm_t* mptr = eptr->mapped;
+    return (unsigned_t*) (ipc_cond_links(ptr) + ptr->lsize);
+}
+
+static int ipc_cond_eval(ipc_shm_t* mptr, ipc_cond_t* ptr, unsigned_t* tail)
+{
     ipc_instr_t* prog;
     ipc_link_t* links = ipc_cond_links(ptr);
     int j = 0;
@@ -391,12 +404,11 @@ static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
 	case 0: break;
 	case 1: condition = !negated; break;
 	default:
-	    if (mptr->data[lptr->qid+1] != QUEUE_MAGIC)
-		return -1;
-	    qptr = (ipc_queue_t*) &mptr->data[lptr->qid];
-	    if (!negated && (qptr->qhead != lptr->qtail))
+	    assert_queue(mptr, qid);
+	    qptr = (ipc_queue_t*) &mptr->data[qid];
+	    if (!negated && (qptr->qhead != tail[q]))
 		condition = 1;
-	    else if (negated && !(qptr->qhead != lptr->qtail))
+	    else if (negated && !(qptr->qhead != tail[q]))
 		condition = 1;
 	    // fprintf(stderr, "  check %s%s = %d\r\n", negated?"~":"",
 	    //	    (char*) qptr->data, condition);
@@ -416,7 +428,7 @@ static int ipc_cond_eval(ipc_env_t* eptr, ipc_cond_t* ptr)
 }
 
 // commit changes for the condition
-static int ipc_cond_commit(ipc_env_t* eptr, ipc_cond_t* ptr)
+static int ipc_cond_commit(ipc_env_t* eptr, ipc_cond_t* ptr, unsigned_t* tail)
 {
     ipc_shm_t* mptr = eptr->mapped;
     ipc_link_t* links = ipc_cond_links(ptr);
@@ -427,9 +439,9 @@ static int ipc_cond_commit(ipc_env_t* eptr, ipc_cond_t* ptr)
     for (j = 0; j < ptr->lsize; j++) {
 	ipc_link_t* lptr = &links[j];
 	unsigned_t qid = lptr->qid;
-	if (qid > 1) {
+	if (qid > 1) {  // qid=0 and 1 are not queues
 	    ipc_queue_t* qptr = (ipc_queue_t*) &mptr->data[qid];
-	    lptr->qtail = qptr->qhead;
+	    tail[j] = qptr->qhead;
 	}
     }
     return 0;
@@ -446,6 +458,9 @@ static void ipc_cond_init(ipc_env_t* eptr,
     pthread_mutexattr_t attrmutex;
     int i, j, offs;
     ipc_shm_t* mptr = eptr->mapped;
+    ipc_instr_t* prog;
+    ipc_link_t*  link;
+    unsigned_t*  tail;
 
     ptr->magic = COND_MAGIC;
     ptr->nsize = number_of_words(n);
@@ -465,32 +480,32 @@ static void ipc_cond_init(ipc_env_t* eptr,
 	   qn*sizeof(ipc_link_t) + ptr->nsize*sizeof(unsigned_t));
     memcpy(ptr->data, buf, n);  // copy name
 
-    // we may memcpy here
+    // install program
+    prog = ipc_cond_prog(ptr);
     offs = ptr->nsize;
-    j = 0;
-    for (i = 0; i < pn; i++) {  // install prog
-	ipc_instr_t* ip = (ipc_instr_t*) &ptr->data[offs+j];
-	*ip = pp[i];
-	j += number_of_words(sizeof(ipc_instr_t));
-    }
+    for (i = 0; i < ptr->psize; i++)
+	prog[i] = pp[i];
 
-    // but not here, index=0 and index=1 are not used, used for
-    // nop and branch always / never
-    offs = ptr->nsize + pn*number_of_words(sizeof(ipc_instr_t));
+    // install links
+    link = ipc_cond_links(ptr);
+    offs += pn*number_of_words(sizeof(ipc_instr_t));
     j = 0;
-    for (i = 0; i < qn; i++) { // install links
-	ipc_queue_t* qptr;
-	ipc_link_t* lp = (ipc_link_t*) &ptr->data[offs+j];
-	lp->coffs = -(offs + j + number_of_words(sizeof(ipc_cond_t)));
-	if ((lp->qid   = qp[i]) > 1) {
-	    qptr = (ipc_queue_t*) &mptr->data[lp->qid];
-	    lp->cnext = qptr->lfirst;
+    for (i = 0; i < qn; i++) {
+	link[i].coffs = -(offs + j + number_of_words(sizeof(ipc_cond_t)));
+	if ((link[i].qid = qp[i]) > 1) {
+	    ipc_queue_t* qptr = (ipc_queue_t*) &mptr->data[link[i].qid];
+	    link[i].cnext = qptr->lfirst;
 	    // lfirst point to current link field
 	    qptr->lfirst = cid + number_of_words(sizeof(ipc_cond_t)) + offs + j;
-	    lp->qtail = 0;  // last updated qhead value
 	}
 	j += number_of_words(sizeof(ipc_link_t));
     }
+
+    // install tail pointers
+    tail = ipc_cond_tail(ptr);
+    offs += qn*number_of_words(sizeof(ipc_link_t));
+    for (i = 0; i < qn; i++)
+	tail[i] = 0;
 }
 
 static int get_type(ErlNifEnv* env, ERL_NIF_TERM arg, unsigned_t* type)
@@ -683,7 +698,8 @@ static ERL_NIF_TERM nif_create_cond(ErlNifEnv* env, int argc,
     }
     size = number_of_words(sizeof(ipc_cond_t)) + number_of_words(n) +
 	number_of_words(sizeof(ipc_instr_t))*pn + 
-	number_of_words(sizeof(ipc_link_t))*qn;
+	number_of_words(sizeof(ipc_link_t))*qn +
+	number_of_words(sizeof(unsigned_t))*qn;
     if ((cptr = ipc_shm_alloc(eptr, size, &cid)) == NULL)
 	return enif_make_badarg(env);  // out of memory?
     ipc_cond_init(eptr, cptr, cid, buf, n, pp, pn, qp, qn);
@@ -757,6 +773,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv* env, int argc,
 	    return enif_make_atom(env, (char*) &cptr->data[0]);
 	else if (argv[1] == ATOM(links)) {
 	    ipc_link_t* lptr = ipc_cond_links(cptr);
+	    unsigned_t* qtail = ipc_cond_tail(cptr);
 	    ERL_NIF_TERM list = enif_make_list(env, 0);
 	    int i;
 
@@ -767,7 +784,7 @@ static ERL_NIF_TERM nif_info(ErlNifEnv* env, int argc,
 					enif_make_long(env, lptr[i].cnext),
 					enif_make_long(env, lptr[i].coffs),
 					enif_make_ulong(env, lptr[i].qid),
-					enif_make_ulong(env, lptr[i].qtail));
+					enif_make_ulong(env, qtail[i]));
 		list = enif_make_list_cell(env, elem, list);
 	    }
 	    return list;
@@ -816,9 +833,10 @@ static ERL_NIF_TERM nif_publish(ErlNifEnv* env, int argc,
     while(offset) {
 	ipc_link_t* lptr = (ipc_link_t*) &mptr->data[offset];
 	ipc_cond_t* cptr = (ipc_cond_t*) &mptr->data[offset+lptr->coffs];
-	if (ipc_cond_eval(eptr, cptr) == 1) {
+	unsigned_t* tail = ipc_cond_tail(cptr);
+	if (ipc_cond_eval(mptr, cptr, tail) == 1) {
 	    pthread_mutex_lock(&cptr->mutex);
-	    ipc_cond_commit(eptr, cptr);
+	    ipc_cond_commit(eptr, cptr, tail);
 	    pthread_cond_broadcast(&cptr->cond);
 	    pthread_mutex_unlock(&cptr->mutex);
 	}
@@ -856,6 +874,11 @@ typedef struct {
     ERL_NIF_TERM  message;
 } subscription_t;
 
+//
+// Fixme: monitor the subscription and wake up the subscription
+// with a cond_signal to delete it and terminate the thread when the
+// process terminates.
+//
 static void* do_wait_cond(void* arg)
 {
     subscription_t* sub = (subscription_t*) arg;
@@ -881,20 +904,33 @@ static void* do_wait_cond(void* arg)
 	tailp = enif_alloc(sizeof(unsigned_t)*nvalues);
 	termp = enif_alloc(sizeof(ERL_NIF_TERM)*nvalues);
     }
+    memset(valp, 0, sizeof(unsigned_t)*nvalues);
+    memset(tailp, 0, sizeof(unsigned_t)*nvalues);
     
     while(1) {
 	int i;
 	ipc_link_t* link = ipc_cond_links(sub->cond);
 	pthread_mutex_lock(&sub->cond->mutex);
-	pthread_cond_wait(&sub->cond->cond, &sub->cond->mutex);
+
+	while(!ipc_cond_eval(sub->mptr, sub->cond, tailp))
+	    pthread_cond_wait(&sub->cond->cond, &sub->cond->mutex);
 
 	// copy values
 	for (i = 2; i < nvalues; i++) {
 	    unsigned_t qid = link[i].qid;
 	    ipc_queue_t* qptr = (ipc_queue_t*) &sub->mptr->data[qid];
-	    valp[i-2] = qptr->data[qptr->nsize + tailp[i]];
-	    tailp[i] = (tailp[i]+1) & qptr->qmask;
+	    unsigned_t qh = qptr->qhead;
+	    if (tailp[i] == qh) {
+		unsigned_t qpos = (qh - 1) & qptr->qmask;  // prev value
+		valp[i-2] = qptr->data[qptr->nsize + qpos];
+	    }
+	    else {
+		unsigned_t qpos = tailp[i];
+		valp[i-2] = qptr->data[qptr->nsize + qpos];
+		tailp[i] = (tailp[i]+1) & qptr->qmask;
+	    }
 	}
+
 	pthread_mutex_unlock(&sub->cond->mutex);
 
 	for (i = 2; i < nvalues; i++) {

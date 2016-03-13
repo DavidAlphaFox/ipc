@@ -22,8 +22,10 @@
 -export([optimise/1]).
 -export([eval/3]).
 -export([dump/0]).
--export([test/0, bench/0, bench_read/1]).
--export([test_compile/0]).
+-export([test_srv/0, test_cli/0]).
+-export([bench_write/0, bench_read/0, bench_read_more/0]).
+-export([bench_write/1, bench_read/1, bench_read_more/1]).
+-export([test_compile/0, test_comp/2]).
 
 %% low level nifs
 -export([publish_/2]).
@@ -158,7 +160,7 @@ dump(Offset) ->
     io:format("~p\n", [info(Offset)]),
     dump(next(Offset)).
 
-test() ->
+test_srv() ->
     create("foo", 64*1024),
     {ok,I1} = create_queue(queue1, unsigned32, 1024),
     {ok,I2} = create_queue(queue2, unsigned32, 1024),
@@ -166,36 +168,67 @@ test() ->
     {ok,I4} = create_queue(my_output, float32, 8),
     %%
     {ok,C1} = create_condition(cond1, {'or', queue1, queue2}),
-    {ok,C2} = create_condition(cond2, {'and', my_queue, my_output}),
-    {ok,C3} = create_condition(cond3, 
+    {ok,C2} = create_condition(cond2, {'and', queue1, queue2}),
+    {ok,C3} = create_condition(cond3, {'xor', queue1, queue2}),
+    {ok,C4} = create_condition(cond4, 
 			       {'xor', {'and', my_queue, my_output},
 				{'and', queue1, queue2}}),
     %%
-    [I1,I2,I3,I4,C1,C2,C3].
+    [I1,I2,I3,I4,C1,C2,C3,C4].
 
-bench() ->
-    N = 2000000,
-    T0 = erlang:system_time(micro_seconds),
-    bench_loop(N),
-    T1 = erlang:system_time(micro_seconds),
-    trunc((N/(T1-T0))*1000000).
+test_cli() ->
+    attach("foo").
 
-bench_loop(0) ->
+-define(BENCH_N,     1000).
+-define(BENCH_SLEEP, 50).   %% micro
+
+bench_write() ->
+    bench_write(queue1).
+
+bench_write(Queue) ->
+    N = ?BENCH_N,
+    case lookup_queue(Queue) of
+	{ok,QID} ->
+	    T0 = erlang:system_time(micro_seconds),
+	    bench_write_loop(N,QID),
+	    T1 = erlang:system_time(micro_seconds),
+	    trunc((N/(T1-T0))*1000000);
+	Error ->
+	    Error
+    end.
+
+bench_write_loop(0,_QID) ->
     ok;
-bench_loop(I) ->
-    ipc:publish(queue1, I),
-    bench_loop(I-1).
+bench_write_loop(I,QID) ->
+    publish(QID, I),
+    sleep_micro(?BENCH_SLEEP),
+    bench_write_loop(I-1,QID).
+
+bench_read() ->
+    bench_read(cond1).
 
 bench_read(Cond) when is_atom(Cond) ->
     case lookup_condition(Cond) of
 	{ok,CID} ->
-	    ipc:subscribe(CID, ready),
+	    subscribe(CID, ready),
 	    timer:send_after(10000, stop),
-	    read_loop(CID, ready, 1000000, 0);
+	    read_loop(CID, ready, ?BENCH_N, 0);
 	Error -> Error
     end.
 
-read_loop(_CID, _Tag, I, N) when I < 0 ->
+%% no extra subscription
+bench_read_more()  ->
+    bench_read_more(cond1).
+
+bench_read_more(Cond) when is_atom(Cond) ->
+    case lookup_condition(Cond) of
+	{ok,CID} ->
+	    timer:send_after(10000, stop),
+	    read_loop(CID, ready, ?BENCH_N, 0);
+	Error -> Error
+    end.
+
+read_loop(_CID, _Tag, I, N) when I =< 0 ->
     N;
 read_loop(CID, Tag, I, N) ->
     receive
@@ -208,6 +241,24 @@ read_loop(CID, Tag, I, N) ->
 	    end;
 	stop ->
 	    N
+    end.
+
+sleep_micro(Micro) ->
+    T0 = erlang:system_time(micro_seconds),
+    Milli = Micro div 1000,
+    if Milli > 10 -> 
+	    timer:sleep(Milli - 2),
+	    T1 = erlang:system_time(micro_seconds),
+	    sleep_micro_spin_(T1,(T1-T0)-Micro);
+       true ->
+	    sleep_micro_spin_(T0,Micro)
+    end.
+
+sleep_micro_spin_(T,Micro) ->
+    erlang:yield(),
+    T1 = erlang:system_time(micro_seconds),
+    if T1 - T >= Micro -> ok;
+       true -> sleep_micro_spin_(T,Micro)
     end.
 
 test_compile() ->
@@ -383,6 +434,7 @@ reach(I, Prog, Mark) ->
 		    reach(I+1,Prog,Mark2)
 	    end
     end.
+
 %%
 %% Move a jump always with the destination instruction
 %%
